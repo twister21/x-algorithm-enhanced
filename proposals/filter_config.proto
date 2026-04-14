@@ -1,0 +1,384 @@
+syntax = "proto3";
+package xai.recommender.filtering;
+
+//
+// User-configurable feed filtering contract.
+//
+// ── DESIGN PRINCIPLES ────────────────────────────────────────────────────────
+//
+// INCLUSIVE vs EXCLUSIVE
+//   Every repeated filter field follows a consistent whitelist/blacklist model:
+//     included_X  empty = ALL allowed; non-empty = ONLY these
+//     excluded_X  empty = NONE excluded; non-empty = exclude these
+//   If both are set, excluded takes precedence.
+//   This means a user who has never touched a setting sees everything.
+//
+// FIELD CARDINALITY → MATCHING STRATEGY
+//   Hard enum   genuinely bounded, exhaustive (graph depth, style, sentiment)
+//               → exact match; defined here as enum
+//   Soft enum   bounded vocabulary, but semantic adjacency matters (tone)
+//               → enum defines vocabulary; scorer uses cosine similarity
+//               → user may also express as free text, parsed by Grok
+//   Free field  open / hierarchical / evolving (topics, account follower range)
+//               → embedded at preference-save time; dot-product at score time
+//               → OR numeric range for follower count
+//
+// NLP PARSING
+//   All fields are expressible via natural language. The intent parser maps
+//   any description to the structured fields below. The client may present
+//   shortcut options (chips, dropdowns) as convenience, but these are purely
+//   UI-layer suggestions — the backend receives the same structured prefs
+//   regardless of how the user expressed them.
+//
+// FEED CONTEXTS
+//   A FeedContext is attached to every request alongside UserFilterPrefs.
+//   Each context has server-side defaults (e.g. Following feed shows all post
+//   types; Explore suppresses replies by default), but UserFilterPrefs can
+//   override any default. Filters apply identically across all feed contexts.
+
+// ── Hard enums ────────────────────────────────────────────────────────────
+
+enum SocialGraphDepth {
+  FOLLOWING_ONLY     = 0;  // n=0, default threshold 0.25
+  FOLLOWERS_OF_FOLLOWERS = 1;  // n=1, default threshold 0.50
+  NETWORK_EXTENDED   = 2;  // n=2, default threshold 0.75
+  GLOBAL             = 3;  // n=3, default threshold 0.95
+}
+
+// Hierarchical style groups.
+// Subcategories (academic, corporate, legal ...) share a group deliberately —
+// the hard filter operates at the group level; topic/embedding filters handle
+// subcategory preferences.
+//
+// ILLICIT (defamation, doxing, threats, incitement) is enforced server-side
+// only and is absent here so it cannot be relaxed. Exception: a user who is
+// the SUBJECT of illicit content may request to see it via
+// UserFilterPrefs.show_illicit_targeting_self.
+enum ContentStyleGroup {
+  STYLE_FORMAL   = 0;  // academic, scientific, corporate, legal, journalistic
+  STYLE_INFORMAL = 1;  // casual, colloquial, slang, dialect, simple, poetic
+  STYLE_VULGAR   = 2;  // swearing, insulting, discriminatory language
+}
+
+// ── Claim type — replaces the ambiguous "objective/subjective" ────────────
+//
+// FACT_CLAIM   author presents a verifiable assertion (may be wrong)
+// OPINION      author presents a personal view, interpretation, or feeling
+// MIXED        post contains both
+//
+// Verification is separate — see VerificationStatus.
+enum ClaimType {
+  CLAIM_FACT    = 0;
+  CLAIM_OPINION = 1;
+  CLAIM_MIXED   = 2;
+}
+
+// ── Verification status — independent of claim type ──────────────────────
+//
+// UNVERIFIED          no fact-check signal attached
+// COMMUNITY_NOTED     has a Community Note from other users
+// AI_CHECKED          Grok or another model has assessed the claim
+// MANUALLY_CHECKED    verified by a human editorial process
+//
+// These are NOT mutually exclusive — a post may be both AI_CHECKED and
+// COMMUNITY_NOTED. The filter operates as a whitelist of accepted statuses.
+enum VerificationStatus {
+  VERIFICATION_NONE     = 0;
+  VERIFICATION_COMMUNITY = 1;
+  VERIFICATION_AI       = 2;
+  VERIFICATION_MANUAL   = 3;
+}
+
+enum Sentiment {
+  SENTIMENT_POSITIVE   = 0;
+  SENTIMENT_NEUTRAL    = 1;
+  SENTIMENT_NEGATIVE   = 2;
+  SENTIMENT_AMBIVALENT = 3;
+}
+
+// ── Soft enum ─────────────────────────────────────────────────────────────
+// Tone: bounded vocabulary, but matching uses cosine similarity so adjacent
+// tones contribute partial credit. Users may also express tone preferences as
+// natural language; the intent parser resolves to enum values AND stores the
+// raw description for dense embedding.
+enum ContentTone {
+  TONE_OBJECTIVE=0;    TONE_NEUTRAL=1;      TONE_ANALYTICAL=2;
+  TONE_ROBOTIC=3;      TONE_SENSATIONALIST=4; TONE_ENTHUSIASTIC=5;
+  TONE_FRIENDLY=6;     TONE_SYMPATHETIC=7;  TONE_DIPLOMATIC=8;
+  TONE_PASSIONATE=9;   TONE_AGGRESSIVE=10;  TONE_ANGRY=11;
+  TONE_ANNOYED=12;     TONE_CONFIDENT=13;   TONE_HUMOROUS=14;
+  TONE_IRONIC=15;      TONE_POLEMIC=16;     TONE_PERSUASIVE=17;
+  TONE_URGENT=18;      TONE_SURPRISED=19;   TONE_APOLOGETIC=20;
+  TONE_SAD=21;         TONE_SKEPTICAL=22;   TONE_CONDESCENDING=23;
+  TONE_OUTRAGED=24;
+}
+
+// Follower-count tiers for quick selection. Users may also specify a custom
+// numeric range in AccountSizeFilter.min_followers / max_followers.
+enum AccountSizeTier {
+  TIER_NANO   = 0;  // < 1k
+  TIER_SMALL  = 1;  // 1k – 10k
+  TIER_MEDIUM = 2;  // 10k – 100k
+  TIER_LARGE  = 3;  // 100k – 1M
+  TIER_MEGA   = 4;  // > 1M
+}
+
+enum RankingBias {
+  BIAS_INTEREST  = 0;  // topical similarity
+  BIAS_SOCIAL    = 1;  // network engagement rate
+  BIAS_DISCOVERY = 2;  // low-impression content
+}
+
+// ── Post types shown in feed ──────────────────────────────────────────────
+// Separate from engagement_types used for recommendation signals.
+enum PostType {
+  POST_ORIGINAL = 0;  // author's own new post
+  POST_REPOST   = 1;  // straight repost with no added text
+  POST_REPLY    = 2;  // reply to another post
+  POST_QUOTE    = 3;  // repost with added commentary
+}
+
+// ── Feed contexts with their server-side defaults ─────────────────────────
+// UserFilterPrefs can override any default in any context.
+enum FeedContext {
+  FEED_FOR_YOU   = 0;  // default: FoF depth, all post types, social proof on
+  FEED_FOLLOWING = 1;  // default: following-only, all types, no interest filter
+  FEED_TOPIC     = 2;  // default: global, original+quote only, topic boosted
+  FEED_EXPLORE   = 3;  // default: global, discovery bias, low-impression boost
+  FEED_SEARCH    = 4;  // default: global, topic match = 1.0, engagement sorts
+  FEED_PROFILE   = 5;  // default: following-only, shows one account's posts
+}
+
+// ── Engagement types used as recommendation signals ───────────────────────
+enum EngagementSignal {
+  SIGNAL_LIKE   = 0;
+  SIGNAL_REPLY  = 1;
+  SIGNAL_REPOST = 2;
+  SIGNAL_POST   = 3;  // user's own posts as expressed interest
+  SIGNAL_DWELL  = 4;  // time spent reading (implicit signal)
+  SIGNAL_CLICK  = 5;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TIME WINDOW
+// ═══════════════════════════════════════════════════════════════════════════
+
+message TimeWindow {
+  oneof window_type {
+    uint32 rolling_days  = 1;  // last N days relative to request time
+    AbsoluteRange fixed  = 2;  // explicit date range
+  }
+}
+
+message AbsoluteRange {
+  int64 start_unix_sec = 1;  // 0 = no lower bound
+  int64 end_unix_sec   = 2;  // 0 = now
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUB-FILTERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Language filter ───────────────────────────────────────────────────────
+//
+// Original language of the post (as authored).
+// Translation display is controlled separately and has three components:
+//   1. Whether to show auto-translated posts at all
+//   2. Whether to show manually translated/dubbed posts (author provided)
+//   3. Which target languages are acceptable for translated display
+//
+// Example: a user reads English and German. Their original language filter
+// is ["en","de"]. They accept manual translations into those languages but
+// not auto-translations. A Spanish post manually translated to English
+// by its author would pass; the same post auto-translated by the platform
+// would not.
+message LanguageFilter {
+  // Whitelist of accepted ORIGINAL languages (ISO 639-1).
+  // Empty = all original languages accepted.
+  repeated string included_original_languages = 1;
+
+  // Whether to include posts that have been AUTO-translated by the platform.
+  // Default: true. Only relevant when the original language is not in
+  // included_original_languages.
+  bool show_auto_translated = 2;
+
+  // Whether to include posts that have been MANUALLY translated or dubbed
+  // by the post's author. Default: true.
+  bool show_manually_translated = 3;
+
+  // Target languages acceptable for translated content (ISO 639-1).
+  // Empty = defaults to included_original_languages.
+  // A translated post only passes if its translation target language is
+  // in this list (or in included_original_languages if this is empty).
+  repeated string accepted_translation_targets = 4;
+}
+
+// ── Style filter (hard enum, whitelist/blacklist) ─────────────────────────
+message StyleFilter {
+  // Whitelist. Empty = all styles shown.
+  repeated ContentStyleGroup included_styles = 1;
+  // Blacklist. Takes precedence over included_styles.
+  repeated ContentStyleGroup excluded_styles = 2;
+}
+
+// ── Tone filter (soft enum + optional dense embedding) ────────────────────
+message ToneFilter {
+  // Whitelist. Empty = all tones shown.
+  repeated ContentTone included_tones = 1;
+  // Blacklist. Soft suppression: high-similarity posts are penalised, not
+  // hard-excluded (to avoid over-filtering).
+  repeated ContentTone suppressed_tones = 2;
+  // Preferred tones receive a score boost.
+  repeated ContentTone preferred_tones = 3;
+
+  double boost_weight    = 4;  // default 0.30
+  double suppress_weight = 5;  // default 0.50
+
+  // Raw natural-language tone description from the user.
+  // Stored so the scorer can use the dense Grok embedding of this string
+  // alongside the enum-resolved values above for richer soft matching.
+  // Example: "thoughtful but not preachy" → also embeds and matches against
+  // post tone embeddings, capturing unlisted adjacent tones.
+  string raw_description = 6;
+}
+
+// May be useful beyond styles and tones to further differentiate
+message LinguisticFilter {
+  double min_coherence = 1;
+  double min_info_density = 2;
+}
+
+// ── Topic filter (free field — embedding-based) ───────────────────────────
+// No enum. Topics are open, hierarchical, and ever-expanding.
+// Topic strings are embedded at preference-save time; matched by dot-product
+// at score time. "AI" naturally covers "LLMs", "fine-tuning", etc.
+message TopicFilter {
+  // Boost topics (free text). Empty = no topic preference.
+  repeated string preferred_topics = 1;
+  // Block topics (free text).
+  repeated string blocked_topics   = 2;
+
+  double boost_weight   = 3;  // default 0.40
+  // 0.0 = soft penalise, 1.0 = hard exclude
+  double block_strength = 4;  // default 0.80
+
+  // Pre-computed embeddings, populated server-side at save time.
+  // Clients never set these; the backend fills them via the text encoder.
+  repeated float preferred_embeddings = 5;  // flattened [n × D]
+  repeated float blocked_embeddings   = 6;
+  int32          embedding_dim        = 7;
+}
+
+// ── Account size filter ───────────────────────────────────────────────────
+// Enum tiers for quick selection AND a numeric range for precise control.
+// The two are OR'd: a post passes if it matches either the tier whitelist
+// or falls within the numeric range (if set).
+// Empty tiers + no numeric range = all account sizes shown.
+message AccountSizeFilter {
+  // Tier whitelist. Empty = all tiers.
+  repeated AccountSizeTier included_tiers = 1;
+  // Custom numeric range. Overrides tiers when set.
+  optional int64 min_followers = 2;
+  optional int64 max_followers = 3;
+}
+
+// ── Claim type and verification filter ───────────────────────────────────
+message ClaimFilter {
+  // Whitelist of accepted claim types. Empty = all claim types shown.
+  repeated ClaimType included_claim_types = 1;
+  // Whitelist of accepted verification statuses. Empty = all shown.
+  repeated VerificationStatus required_verification = 2;
+}
+
+// ── Post type filter (what appears in the feed) ──────────────────────────
+// Distinct from EngagementSignals used for recommendation.
+// This controls which post types are shown, regardless of relevance score.
+// Example: a user who wants a "Following" experience without reposts.
+message PostTypeFilter {
+  // Whitelist. Empty = all post types shown.
+  repeated PostType included_post_types = 1;
+}
+
+// ── Recommendation signal preferences ────────────────────────────────────
+// Which of the user's own past engagements feed the interest model,
+// and how much weight each carries.
+message RecommendationSignalPrefs {
+  // Whitelist of signals used for interest profile. Empty = all signals.
+  repeated EngagementSignal included_signals = 1;
+  // Per-signal weight overrides. Missing keys use server defaults:
+  //   POST=5.0, REPOST=3.0, REPLY=2.0, LIKE=1.0, DWELL=0.5, CLICK=0.5
+  map<int32, double> signal_weights = 2;
+  // How far back in engagement history to build the interest profile.
+  TimeWindow history_window = 3;
+}
+
+// ── Social proof config ───────────────────────────────────────────────────
+message SocialProofConfig {
+  // Minimum n=0 followed accounts who saw this post to trigger relaxation.
+  uint32 min_friend_overlap     = 1;  // default 3
+  double relaxed_threshold      = 2;  // default 0.15
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOP-LEVEL USER FILTER PREFERENCES
+// ═══════════════════════════════════════════════════════════════════════════
+
+message UserFilterPrefs {
+  // Social graph pool
+  SocialGraphDepth graph_depth = 1;
+  map<int32, double> graph_similarity_overrides = 2;
+
+  // Content age window (how old shown posts may be)
+  TimeWindow content_age_window = 3;
+
+  // Sub-filters
+  LanguageFilter  language    = 4;
+  StyleFilter     style       = 5;
+  ToneFilter      tone        = 6;
+  TopicFilter     topics      = 7;
+  AccountSizeFilter account_size = 8;
+  ClaimFilter     claims      = 9;
+  PostTypeFilter  post_types  = 10;
+
+  // Sentiment whitelist. Empty = all sentiments shown.
+  repeated Sentiment included_sentiments = 11;
+
+  // Recommendation signals
+  RecommendationSignalPrefs signals = 12;
+
+  // Social proof
+  SocialProofConfig social_proof = 13;
+
+  // Presentation
+  RankingBias bias                     = 14;
+  bool boost_low_impression_content    = 15;
+  int32 low_impression_threshold       = 16;  // default 5000
+  double engagement_vs_impression_ratio = 17;  // 0=count, 1=rate; default 0.5
+
+  // Illicit content: a user who is the SUBJECT of illicit content
+  // (e.g. defamation or doxing targeting them) may opt in to see it.
+  // Only content flagged as targeting the requesting user is unlocked.
+  // This field cannot unlock content targeting others.
+  bool show_illicit_targeting_self = 18;
+
+  // Stored for auditability. Structured fields above are authoritative.
+  string grok_intent_description = 19;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FEED REQUEST
+// ═══════════════════════════════════════════════════════════════════════════
+
+message FeedRequest {
+  int64             user_id     = 1;
+  FeedContext       context     = 2;
+  UserFilterPrefs   prefs       = 3;  // overrides context defaults when set
+
+  // For FEED_TOPIC: the topic this feed is pinned to.
+  // Embedded server-side and used as a mandatory topic filter on top of prefs.
+  string pinned_topic = 4;
+
+  // Raw natural-language filter description, parsed server-side by Grok
+  // into prefs fields. Ignored when prefs is fully populated.
+  string filter_description = 5;
+}
