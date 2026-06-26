@@ -1,6 +1,6 @@
 # X-Algorithm Enhanced: User-Steerable Feed Reference Implementation
 
-These files provides a reference implementation for enhancing the X recommendation systems, specifically focusing on **user-based steerability**. 
+These files provide a reference implementation for enhancing the X recommendation system, specifically focusing on **user control**. 
 
 The logic contained here is based on the proposals found in [twitter/the-algorithm#1449](https://github.com/twitter/the-algorithm/issues/1449).
 
@@ -25,13 +25,13 @@ To ensure content relevance, the implementation utilizes three distinct strategi
 
 ### 3. Temporal Interest Inference
 The algorithm differentiates between content age and user interest duration:
-* **Interest Windows:** Distinguishes between short-term "spikes" (e.g., breaking news) and long-term interests.
+* **Interest Windows:** Distinguish between short-term "spikes" (e.g., breaking news) and long-term interests.
 * **Content Decay:** Logic for how content age interacts with user-defined steerability weights.
 
 ## Technical Implementation Note
 
 ### Python as a Blueprint
-The code in written in Python to provide a clear, readable reference for the underlying logic.
+The code is written in Python to provide a clear, readable reference for the underlying logic.
 
 ### Transitioning to Rust
 Translating these concepts into the production environment (the official Rust codebase) requires access to internal traits and modules. Specifically, full integration depends on:
